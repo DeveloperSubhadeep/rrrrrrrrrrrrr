@@ -154,147 +154,128 @@
 #         },
 #     )
 
+# in route.py
+
 from aiohttp import web
 import re
 import math
 import logging
 import secrets
-import time
 import mimetypes
 from aiohttp.http_exceptions import BadStatusLine
-from dreamxbotz.Bot import multi_clients, work_loads, dreamxbotz
+from dreamxbotz.Bot import multi_clients, work_loads
 from dreamxbotz.server.exceptions import FIleNotFound, InvalidHash
-from dreamxbotz.zzint import StartTime, __version__
 from dreamxbotz.util.custom_dl import ByteStreamer
-from dreamxbotz.util.time_format import get_readable_time
-from dreamxbotz.util.render_template import render_page
+# Make sure render_page is imported if it's in another file
+from dreamxbotz.util.render_template import render_page 
 from info import *
 
 routes = web.RouteTableDef()
 
-# --- HELPER FUNCTION FOR FILE SIZE (ADD THIS) ---
 def format_bytes(size):
-    if not size:
-        return ""
+    if not size: return ""
     power = 1024
     n = 0
-    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size > power:
+    power_labels = {0: 'Bytes', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
+    while size > power and n < len(power_labels) -1 :
         size /= power
         n += 1
-    return f"{round(size, 2)} {power_labels[n]}B"
+    return f"{round(size, 2)} {power_labels[n]}"
 
-@routes.get("/favicon.ico")
-async def favicon_route_handler(request):
-    return web.FileResponse('dreamxbotz/template/favicon.ico')
+# ... (keep your favicon and root routes) ...
 
-@routes.get("/", allow_head=True)
-async def root_route_handler(request):
-    return web.json_response("dreamxbotz")
-
-# --- (MODIFIED) - WATCH/STREAM PAGE ROUTE ---
-# This route now also generates the link to our new download page
-@routes.get(r"/watch/{path:\S+}", allow_head=True)
-async def stream_handler(request: web.Request):
+# ROUTE 1: Serves the streaming page (e.g., dl.html or req.html)
+@routes.get(r"/watch/{path:\S+}")
+async def watch_handler(request: web.Request):
     try:
         path = request.match_info["path"]
         match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
-        if match:
-            secure_hash = match.group(1)
-            id = int(match.group(2))
-        else:
-            id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
-            secure_hash = request.rel_url.query.get("hash")
-            
-        # --- NEW: Generate the URL for the download page ---
+        if not match:
+            raise FIleNotFound("Invalid link format")
+
+        secure_hash, id_str = match.groups()
+        id = int(id_str)
+        
+        # This will be passed to the template, so the "Download" button knows where to go.
+        # It points to ROUTE 2.
         download_page_url = f"/download/{secure_hash}{id}"
         
-        # You need to modify render_page to accept and use this new URL
-        # For now, let's assume it passes it to the template
-        return web.Response(text=await render_page(id, secure_hash, download_page_url), content_type='text/html')
-    except InvalidHash as e:
-        raise web.HTTPForbidden(text=e.message)
-    except FIleNotFound as e:
-        raise web.HTTPNotFound(text=e.message)
-    except (AttributeError, BadStatusLine, ConnectionResetError):
-        pass
-    except Exception as e:
-        logging.critical(e.with_traceback(None))
-        raise web.HTTPInternalServerError(text=str(e))
+        # render_page needs to be able to handle this extra argument.
+        # See the explanation in the next section on how to modify render_page.
+        html_content = await render_page(id, secure_hash, download_page_url=download_page_url)
+        return web.Response(text=html_content, content_type='text/html')
 
-# --- (NEW) - DOWNLOAD PAGE ROUTE ---
-# This route serves the interactive download.html page
-@routes.get(r"/download/{path:\S+}", allow_head=True)
+    except (InvalidHash, FIleNotFound) as e:
+        raise web.HTTPForbidden(text=str(e))
+    except Exception as e:
+        logging.critical(f"Error in watch_handler: {e}", exc_info=True)
+        raise web.HTTPInternalServerError(text="Internal Server Error")
+
+# ROUTE 2: Serves the interactive download.html page
+@routes.get(r"/download/{path:\S+}")
 async def download_page_handler(request: web.Request):
     try:
         path = request.match_info["path"]
         match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
         if not match:
-            raise FIleNotFound
+            raise FIleNotFound("Invalid link format")
 
         secure_hash, id_str = match.groups()
         id = int(id_str)
         
-        # Get file properties
         index = min(work_loads, key=work_loads.get)
-        faster_client = multi_clients[index]
-        tg_connect = ByteStreamer(faster_client)
-        file_id = await tg_connect.get_file_properties(id)
+        client = multi_clients[index]
+        tg_connect = ByteStreamer(client) # Assuming ByteStreamer takes a client
+        file_props = await tg_connect.get_file_properties(id)
         
-        if file_id.unique_id[:6] != secure_hash:
-            raise InvalidHash
+        if file_props.unique_id[:6] != secure_hash:
+            raise InvalidHash("Invalid hash")
 
-        file_name = file_id.file_name
-        file_size_bytes = file_id.file_size
-        file_size_formatted = format_bytes(file_size_bytes)
-        file_type = file_name.split('.')[-1].upper() if '.' in file_name else "File"
-        actual_download_url = f"/{secure_hash}{id}"
+        # This URL points to ROUTE 3 for the actual file.
+        actual_download_url = f"/stream/{secure_hash}{id_str}/{secrets.token_urlsafe(5)}/{file_props.file_name}"
 
-        # Read the template file
         with open("dreamxbotz/template/download.html", "r", encoding="utf-8") as f:
             template = f.read()
 
-        # Replace placeholders with actual data
-        page_html = template.replace("{{file_name}}", file_name) \
-                              .replace("{{file_type}}", f"{file_type} Video") \
-                              .replace("{{total_size_formatted}}", file_size_formatted) \
-                              .replace("{{total_size_bytes}}", str(file_size_bytes)) \
-                              .replace("{{actual_download_url}}", actual_download_url)
+        html_content = template.replace("{{file_name}}", file_props.file_name) \
+                               .replace("{{file_type}}", file_props.file_name.split('.')[-1].upper() if '.' in file_props.file_name else "File") \
+                               .replace("{{total_size_formatted}}", format_bytes(file_props.file_size)) \
+                               .replace("{{total_size_bytes}}", str(file_props.file_size)) \
+                               .replace("{{actual_download_url}}", actual_download_url)
 
-        return web.Response(text=page_html, content_type='text/html')
-        
-    except InvalidHash:
-        raise web.HTTPForbidden(text="Invalid Link")
-    except FIleNotFound:
-        raise web.HTTPNotFound(text="File Not Found")
+        return web.Response(text=html_content, content_type='text/html')
+
+    except (InvalidHash, FIleNotFound) as e:
+        raise web.HTTPForbidden(text=str(e))
     except Exception as e:
-        logging.error(f"Error in download page handler: {e}", exc_info=True)
-        raise web.HTTPInternalServerError(text="An internal error occurred")
+        logging.critical(f"Error in download_page_handler: {e}", exc_info=True)
+        raise web.HTTPInternalServerError(text="Internal Server Error")
 
-
-# --- (UNMODIFIED) - RAW FILE STREAMING ROUTE ---
-# This route remains the same as it serves the actual file bytes.
-@routes.get(r"/{path:\S+}", allow_head=True)
+# ROUTE 3: Serves the actual file for streaming AND downloading
+@routes.get(r"/stream/{path:\S+}")
 async def stream_handler(request: web.Request):
     try:
         path = request.match_info["path"]
-        match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
-        if match:
-            secure_hash = match.group(1)
-            id = int(match.group(2))
-        else:
-            id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
-            secure_hash = request.rel_url.query.get("hash")
+        # The regex now expects the new format: hash+id/garbage/filename
+        match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)", path)
+        if not match:
+            raise FIleNotFound("Invalid stream URL")
+        
+        secure_hash, id_str = match.groups()
+        id = int(id_str)
+
         return await media_streamer(request, id, secure_hash)
-    except InvalidHash as e:
-        raise web.HTTPForbidden(text=e.message)
-    except FIleNotFound as e:
-        raise web.HTTPNotFound(text=e.message)
+        
+    except (InvalidHash, FIleNotFound) as e:
+        raise web.HTTPForbidden(text=str(e))
     except (AttributeError, BadStatusLine, ConnectionResetError):
-        pass
+        pass # These are common client-side disconnect errors, safe to ignore
     except Exception as e:
-        logging.critical(e.with_traceback(None))
-        raise web.HTTPInternalServerError(text=str(e))
+        logging.critical(f"Error in stream_handler: {e}", exc_info=True)
+        raise web.HTTPInternalServerError(text="Internal Server Error")
+
+# The original media_streamer function remains the same.
+# class_cache and media_streamer logic is OK.
         
 
 class_cache = {}
